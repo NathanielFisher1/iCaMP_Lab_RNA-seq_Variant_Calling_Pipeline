@@ -1,3 +1,5 @@
+## iCaMP Lab RNA-seq Variant Calling Pipeline
+
 This is a pipeline developed for variant calling from RNA-seq data.
 
 To run the pipeline, first create a star directory in ./star/ since this is too large be uploaded to github.
