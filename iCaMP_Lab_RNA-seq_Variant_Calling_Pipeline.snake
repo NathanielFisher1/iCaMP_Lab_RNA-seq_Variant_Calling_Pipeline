@@ -1,0 +1,138 @@
+####################################################################################################
+########## This is a pipeline to call Mitochondrial variants from RNA-seq Data #####################
+####################################################################################################
+import os 
+
+#Input is pre-aligned bam file that has been filtered to only contain reads mapping to chrM
+
+## MODIFY ##
+BAM_DIR="{INPUT_BAM_DIRECTORY_HERE}"
+## MODIFY ##
+BAM_EXT=".chrM.sorted.bam"
+
+
+# Get all bam files
+bam_files = []
+for file in os.listdir(BAM_DIR):
+    if file.endswith(BAM_EXT):
+        bam_files.append(file)
+
+# Get all sample IDS
+INPUT_ID = [val.replace(BAM_EXT,"") for val in bam_files]
+
+# rule all is final conensus vcf output
+rule all:
+    input:
+        expand("vcf_files_rCRS/{SAMPLE_ID}_rCRS_splitted.vcf.gz", SAMPLE_ID = INPUT_ID)
+
+# convert bam files (ideally NUMT filtered chrM reads (previously aligned to chrM with bwa))
+# to fq files, but first sort by read name for alignmentment of paired reads
+
+rule bam_2_fq:
+    input:
+        bam = f"{BAM_DIR}{{SAMPLE_ID}}{BAM_EXT}"
+    output:
+        fq_1 = "fq_files/{SAMPLE_ID}_R1.fq",
+        fq_2 = "fq_files/{SAMPLE_ID}_R2.fq",
+        fq_s = "fq_files/{SAMPLE_ID}_SINGLETON.fq"
+    threads: 1
+    conda: "envs/samtools_ENV.yml"
+    log: "logs/bam_2_fq_{SAMPLE_ID}.log"
+    shell:
+        '''
+        samtools sort -n {input.bam} | samtools fastq -1 {output.fq_1} -2 {output.fq_2} -s {output.fq_s} -0 /dev/null -n 2>>{log}
+        '''    
+
+# align reads with star to rcrs
+rule star_rCRS:
+    input:
+        fq1 = "fq_files/{SAMPLE_ID}_R1.fq",
+        fq2 = "fq_files/{SAMPLE_ID}_R2.fq",
+        fq_s = "fq_files/{SAMPLE_ID}_SINGLETON.fq"
+    output:
+        aligned_bam = "rCRS_aligned_STAR/{SAMPLE_ID}_rCRS_Aligned.out.bam"
+    threads: 1
+    conda: "envs/star_ENV.yml"
+    log: "logs/star_rCRS_{SAMPLE_ID}.log"
+    shell:
+        '''
+        STAR --genomeDir ./star/star_mtDNAref_index \
+        --runThreadN 1 --readFilesIn {input.fq1} {input.fq2} --outFileNamePrefix ./rCRS_aligned_STAR/{wildcards.SAMPLE_ID}_rCRS_ --outSAMtype BAM Unsorted --outSAMmapqUnique 60 \
+        --outSAMunmapped Within --outSAMattributes Standard 2>>{log}
+
+        # now remove fastq files
+        rm {input.fq1} {input.fq2} {input.fq_s} 2>>{log}
+        '''   
+
+# call variants with GATK
+rule gatk_rCRS:
+    input:
+        bam = "rCRS_aligned_STAR/{SAMPLE_ID}_rCRS_Aligned.out.bam"
+    output:
+        vcf = "vcf_files_rCRS/{SAMPLE_ID}_rCRS.vcf"
+    threads: 4
+    conda: "envs/samtools_gatk_ENV.yml"
+    log: "logs/gatk_rCRS_{SAMPLE_ID}.log"
+    shell:
+        '''
+        gatk AddOrReplaceReadGroups -I {input.bam} -O {wildcards.SAMPLE_ID}-addedReadGroup.bam -LB Pond -PL ILLUMINA -PU 0 -SM {wildcards.SAMPLE_ID} 2>>{log}
+        samtools sort {wildcards.SAMPLE_ID}-addedReadGroup.bam -o {wildcards.SAMPLE_ID}-addedReadGroup-sorted.bam 2>>{log}
+        samtools index -b {wildcards.SAMPLE_ID}-addedReadGroup-sorted.bam 2>>{log}
+        gatk Mutect2 -R ./chrM_reference/chrMref.fa \
+        -L chrM --mitochondria-mode -I {wildcards.SAMPLE_ID}-addedReadGroup-sorted.bam -O {output.vcf} --min-base-quality-score 30 2>>{log}
+        rm {wildcards.SAMPLE_ID}-addedReadGroup.bam* 2>>{log}
+        rm {wildcards.SAMPLE_ID}-addedReadGroup-sorted.bam* 2>>{log}
+        rm {input.bam} 2>>{log}
+        '''
+# Bgzip vcf output
+rule bgzip_3:
+    input:
+        vcf = "vcf_files_rCRS/{SAMPLE_ID}_rCRS.vcf"
+    output:
+        vcf_gz = "vcf_files_rCRS/{SAMPLE_ID}_rCRS.vcf.gz"
+    threads: 1
+    conda: "envs/htslib_ENV.yml"
+    log: "logs/bgzip_3_{SAMPLE_ID}.log"
+    shell:
+        '''
+        bgzip -i {input.vcf} 2>>{log}
+        '''
+
+# Index vcf output
+rule tabix_3:
+    input:
+        vcf_gz = "vcf_files_rCRS/{SAMPLE_ID}_rCRS.vcf.gz"
+    output:
+        vcf_gz_tbi = "vcf_files_rCRS/{SAMPLE_ID}_rCRS.vcf.gz.tbi"
+    params:
+    threads: 1
+    conda: "envs/samtools_ENV.yml"
+    log: "logs/tabix_3_{SAMPLE_ID}.log"
+    shell:
+        '''         
+        tabix -p vcf {input.vcf_gz} 2>>{log}
+        '''
+        
+# Split multuallelic sites
+rule split_multiallele_2:
+    input:
+        vcf_gz = "vcf_files_rCRS/{SAMPLE_ID}_rCRS.vcf.gz",
+        vcf_gz_tbi = "vcf_files_rCRS/{SAMPLE_ID}_rCRS.vcf.gz.tbi"
+    output:
+        vcf_splitted = "vcf_files_rCRS/{SAMPLE_ID}_rCRS_splitted.vcf.gz"
+    params:
+        reference = "chrM_reference/chrMref.fa"
+    threads: 1
+    conda: "envs/samtools_gatk_ENV.yml"
+    log: "logs/split_multiallele_2_{SAMPLE_ID}.log"
+    shell:
+        '''
+        gatk LeftAlignAndTrimVariants \
+        -R {params.reference} \
+        -V {input.vcf_gz} \
+        -O {output.vcf_splitted} \
+        --split-multi-allelics \
+        --keep-original-ac 2>>{log}
+        '''     
+
+
